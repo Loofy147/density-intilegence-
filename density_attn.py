@@ -149,6 +149,35 @@ class GroupedMomentAttn(nn.Module):
         combo = torch.cat([mean_o_flat, var_g_flat], dim=-1)
         return self.proj(combo)
 
+class MomentModulatedAttn(nn.Module):
+    """Moment-Modulated Attention (MMA):
+    Computes weighted mean and variance. The variance is used to modulate (gate)
+    the mean output, allowing the model to suppress noisy information."""
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.h, self.hd = n_heads, d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
+        self.proj = nn.Linear(d_model, d_model)
+    def forward(self, x):
+        B, T, D = x.shape
+        H, hd = self.h, self.hd
+        qkv = self.qkv(x).view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        a = (q @ k.transpose(-2, -1)) / hd ** 0.5
+        a = a.softmax(-1)
+
+        mean_o = a @ v
+        mean_sq_o = a @ (v**2)
+        var_o = torch.relu(mean_sq_o - mean_o**2)
+
+        mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        var_o = var_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+
+        # Modulate mean by variance-based gate
+        modulated = mean_o * self.gate(var_o)
+        return self.proj(modulated)
+
 class Block(nn.Module):
     def __init__(self, d_model, n_heads, attn_cls, ff_mult=4):
         super().__init__()
@@ -162,27 +191,41 @@ class Block(nn.Module):
         return x
 
 class CorrEstimator(nn.Module):
-    def __init__(self, D, d_model=64, n_heads=4, n_layers=2, attn_cls=StdAttn):
+    def __init__(self, D, d_model=64, n_heads=4, n_layers=2, attn_cls=StdAttn, map_pooling=True):
         super().__init__()
+        self.map_pooling = map_pooling
         self.embed = nn.Linear(D, d_model)
         self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         out_dim = D * (D - 1) // 2
-        self.head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, out_dim))
+
+        # If MAP, input to head is 2 * d_model (mean + var)
+        head_in = 2 * d_model if map_pooling else d_model
+        self.head = nn.Sequential(nn.Linear(head_in, d_model), nn.GELU(), nn.Linear(d_model, out_dim))
+
     def forward(self, x):
         # Input Standardization: center and scale raw features before embedding
         x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-6)
         h = self.embed(x)
         for blk in self.blocks:
             h = blk(h)
-        h = self.ln_f(h).mean(dim=1)  # pool over the T samples (set, not sequence)
-        return self.head(h)
+        h = self.ln_f(h)
+
+        if self.map_pooling:
+            # Moment-Augmented Pooling (MAP)
+            pool_mean = h.mean(dim=1)
+            pool_var = h.var(dim=1)
+            pool = torch.cat([pool_mean, pool_var], dim=-1)
+        else:
+            pool = h.mean(dim=1)
+
+        return self.head(pool)
 
 # ---------- training ----------
 
-def train_and_eval(D, dist, attn_cls, Xte, Yte, steps=800, T=64, B=64, lr=3e-3, log_every=None):
+def train_and_eval(D, dist, attn_cls, Xte, Yte, steps=800, T=64, B=64, lr=3e-3, log_every=None, map_pooling=True):
     torch.manual_seed(123)
-    model = CorrEstimator(D, attn_cls=attn_cls)
+    model = CorrEstimator(D, attn_cls=attn_cls, map_pooling=map_pooling)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     history = []
     for step in range(steps):
@@ -219,12 +262,18 @@ if __name__ == '__main__':
             target_var = float(((Yte - Yte.mean(0)) ** 2).mean())
 
             row = {'D': D, 'dist': dist, 'empirical_corr_mse': base_mse, 'predict_mean_mse': target_var}
-            variants = [('standard', StdAttn), ('density', DensityAttn), ('moment', MomentAttn), ('gma', GroupedMomentAttn)]
-            for name, cls in variants:
+            variants = [
+                ('standard', StdAttn, True),
+                ('density', DensityAttn, True),
+                ('moment', MomentAttn, True),
+                ('gma', GroupedMomentAttn, True),
+                ('mma', MomentModulatedAttn, True)
+            ]
+            for name, cls, map_p in variants:
                 np.random.seed(data_seed)  # both models see identical training data sequence
                 t0 = time.time()
                 log_every = 200 if D == 8 else None
-                mse, nparams, hist = train_and_eval(D, dist, cls, Xte, Yte, steps=STEPS, log_every=log_every)
+                mse, nparams, hist = train_and_eval(D, dist, cls, Xte, Yte, steps=STEPS, log_every=log_every, map_pooling=map_p)
                 dt = time.time() - t0
                 row[f'{name}_mse'] = mse
                 row[f'{name}_params'] = nparams
@@ -239,12 +288,8 @@ if __name__ == '__main__':
         improve_dens = 100 * (1 - r['density_mse'] / r['standard_mse'])
         improve_mom = 100 * (1 - r['moment_mse'] / r['standard_mse'])
         improve_gma = 100 * (1 - r['gma_mse'] / r['standard_mse'])
+        improve_mma = 100 * (1 - r['mma_mse'] / r['standard_mse'])
         print(f"D={r['D']:2d} {r['dist']:10s} | empirical={r['empirical_corr_mse']:.5f} "
               f"predict-mean={r['predict_mean_mse']:.5f} | standard={r['standard_mse']:.5f} "
-              f"density={r['density_mse']:.5f} moment={r['moment_mse']:.5f} gma={r['gma_mse']:.5f}")
-        print(f"   density improvement={improve_dens:+.1f}% | moment={improve_mom:+.1f}% | gma={improve_gma:+.1f}%")
-        if 'standard_history' in r:
-            print("   std history :", r.get('standard_history', []))
-            print("   density_history:", r.get('density_history', []))
-            print("   moment_history:", r.get('moment_history', []))
-            print("   gma_history   :", r.get('gma_history', []))
+              f"density={r['density_mse']:.5f} moment={r['moment_mse']:.5f} gma={r['gma_mse']:.5f} mma={r['mma_mse']:.5f}")
+        print(f"   density improve={improve_dens:+.1f}% | moment={improve_mom:+.1f}% | gma={improve_gma:+.1f}% | mma={improve_mma:+.1f}%")
