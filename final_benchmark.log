@@ -1,0 +1,26 @@
+D= 4 dist=gaussian   model=standard mse=0.01195 params=109062 time=22.0s
+D= 4 dist=gaussian   model=mma_map  mse=0.01127 params=117382 time=20.2s
+D= 4 dist=gaussian   model=anchored mse=0.00960 params=117382 time=20.5s
+D= 4 dist=gaussian   model=shrinkage mse=0.00944 params=117057 time=20.8s
+D= 4 dist=student_t  model=standard mse=0.01643 params=109062 time=17.3s
+D= 4 dist=student_t  model=mma_map  mse=0.01500 params=117382 time=20.3s
+D= 4 dist=student_t  model=anchored mse=0.02091 params=117382 time=20.6s
+D= 4 dist=student_t  model=shrinkage mse=0.02244 params=117057 time=23.3s
+D= 8 dist=gaussian   model=standard mse=0.01414 params=110748 time=17.0s
+D= 8 dist=gaussian   model=mma_map  mse=0.01416 params=119068 time=20.4s
+D= 8 dist=gaussian   model=anchored mse=0.01043 params=119068 time=20.9s
+D= 8 dist=gaussian   model=shrinkage mse=0.01010 params=117313 time=20.7s
+D= 8 dist=student_t  model=standard mse=0.01907 params=110748 time=17.3s
+D= 8 dist=student_t  model=mma_map  mse=0.01888 params=119068 time=22.6s
+D= 8 dist=student_t  model=anchored mse=0.02674 params=119068 time=21.2s
+D= 8 dist=student_t  model=shrinkage mse=0.02333 params=117313 time=21.3s
+
+=== SUMMARY ===
+D= 4 gaussian   | empirical=0.00967 | std=0.01195 mma=0.01127 anc=0.00960 shr=0.00944
+   mma improve=+5.7% | anc=+19.7% | shr=+21.0%
+D= 4 student_t  | empirical=0.02532 | std=0.01643 mma=0.01500 anc=0.02091 shr=0.02244
+   mma improve=+8.7% | anc=-27.2% | shr=-36.5%
+D= 8 gaussian   | empirical=0.01045 | std=0.01414 mma=0.01416 anc=0.01043 shr=0.01010
+   mma improve=-0.1% | anc=+26.2% | shr=+28.6%
+D= 8 student_t  | empirical=0.02731 | std=0.01907 mma=0.01888 anc=0.02674 shr=0.02333
+   mma improve=+1.0% | anc=-40.2% | shr=-22.3%
