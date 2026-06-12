@@ -51,7 +51,7 @@ class StdAttn(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         a = (q @ k.transpose(-2, -1)) / self.hd ** 0.5
         a = a.softmax(-1)
-        o = (a @ v).permute(0, 2, 1, 3).reshape(B, T, D)
+        o = (a @ v).permute(0, 2, 1, 3).reshape(B, T, -1)
         return self.proj(o)
 
 class DensityAttn(nn.Module):
@@ -80,9 +80,34 @@ class DensityAttn(nn.Module):
         cov_flat = cov.reshape(B, H, T, hd * hd)
         cov_flat = self.cov_ln(cov_flat)
         cov_o = self.cov_proj(cov_flat)
-        mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, D)
-        cov_o = cov_o.permute(0, 2, 1, 3).reshape(B, T, D)
+        mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        cov_o = cov_o.permute(0, 2, 1, 3).reshape(B, T, -1)
         combo = torch.cat([mean_o, cov_o], dim=-1)
+        return self.proj(combo)
+
+class MomentAttn(nn.Module):
+    """Improved Density variant: uses weighted mean and weighted variance.
+    Complexity: O(T^2 * d + T * d), avoiding full covariance O(T^2 * d + T * d^2)."""
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.h, self.hd = n_heads, d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.proj = nn.Linear(2 * d_model, d_model)
+    def forward(self, x):
+        B, T, D = x.shape
+        H, hd = self.h, self.hd
+        qkv = self.qkv(x).view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        a = (q @ k.transpose(-2, -1)) / hd ** 0.5
+        a = a.softmax(-1)
+
+        mean_o = a @ v # B, H, T, hd
+        mean_sq_o = a @ (v**2) # B, H, T, hd
+        var_o = torch.relu(mean_sq_o - mean_o**2)
+
+        mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        var_o = var_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        combo = torch.cat([mean_o, var_o], dim=-1)
         return self.proj(combo)
 
 class Block(nn.Module):
@@ -106,6 +131,8 @@ class CorrEstimator(nn.Module):
         out_dim = D * (D - 1) // 2
         self.head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, out_dim))
     def forward(self, x):
+        # Input Standardization: center and scale raw features before embedding
+        x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-6)
         h = self.embed(x)
         for blk in self.blocks:
             h = blk(h)
@@ -117,7 +144,7 @@ class CorrEstimator(nn.Module):
 def train_and_eval(D, dist, attn_cls, Xte, Yte, steps=800, T=64, B=64, lr=3e-3, log_every=None):
     torch.manual_seed(123)
     model = CorrEstimator(D, attn_cls=attn_cls)
-    opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
     history = []
     for step in range(steps):
         Xb, Yb = sample_batch(B, T, D, dist=dist)
@@ -153,7 +180,7 @@ if __name__ == '__main__':
             target_var = float(((Yte - Yte.mean(0)) ** 2).mean())
 
             row = {'D': D, 'dist': dist, 'empirical_corr_mse': base_mse, 'predict_mean_mse': target_var}
-            for name, cls in [('standard', StdAttn), ('density', DensityAttn)]:
+            for name, cls in [('standard', StdAttn), ('density', DensityAttn), ('moment', MomentAttn)]:
                 np.random.seed(data_seed)  # both models see identical training data sequence
                 t0 = time.time()
                 log_every = 200 if D == 8 else None
@@ -169,10 +196,13 @@ if __name__ == '__main__':
 
     print("\n=== SUMMARY ===")
     for r in results:
-        improve = 100 * (1 - r['density_mse'] / r['standard_mse'])
+        improve_dens = 100 * (1 - r['density_mse'] / r['standard_mse'])
+        improve_mom = 100 * (1 - r['moment_mse'] / r['standard_mse'])
         print(f"D={r['D']:2d} {r['dist']:10s} | empirical={r['empirical_corr_mse']:.5f} "
               f"predict-mean={r['predict_mean_mse']:.5f} | standard={r['standard_mse']:.5f} "
-              f"density={r['density_mse']:.5f} | density improvement={improve:+.1f}%")
+              f"density={r['density_mse']:.5f} moment={r['moment_mse']:.5f}")
+        print(f"   density improvement={improve_dens:+.1f}% | moment improvement={improve_mom:+.1f}%")
         if 'standard_history' in r:
-            print("   std history :", r['standard_history'])
-            print("   dens history:", r['density_history'])
+            print("   std history :", r.get('standard_history', []))
+            print("   density_history:", r.get('density_history', []))
+            print("   moment_history:", r.get('moment_history', []))
