@@ -110,6 +110,45 @@ class MomentAttn(nn.Module):
         combo = torch.cat([mean_o, var_o], dim=-1)
         return self.proj(combo)
 
+class GroupedMomentAttn(nn.Module):
+    """Grouped Moment Attention (GMA):
+    Every head computes a weighted mean (full-rank), but only G groups
+    compute the variance (shared moments), reducing parameter overhead."""
+    def __init__(self, d_model, n_heads, n_groups=1):
+        super().__init__()
+        self.h, self.hd = n_heads, d_model // n_heads
+        self.g = n_groups
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        # Final projection: h * hd (means) + g * hd (variances)
+        self.proj = nn.Linear(d_model + self.g * self.hd, d_model)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        H, hd, G = self.h, self.hd, self.g
+        qkv = self.qkv(x).view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        a = (q @ k.transpose(-2, -1)) / hd ** 0.5
+        a = a.softmax(-1)
+
+        # 1. Full-Rank Means
+        mean_o = a @ v # B, H, T, hd
+
+        # 2. Shared Moments (Grouped Variance)
+        # We take the first 'G' heads to represent our moment groups
+        v_g = v[:, :G, :, :]
+        a_g = a[:, :G, :, :]
+
+        mean_sq_g = a_g @ (v_g**2)
+        var_g = torch.relu(mean_sq_g - (mean_o[:, :G, :, :]**2))
+
+        # 3. Combine
+        mean_o_flat = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1) # B, T, d_model
+        var_g_flat = var_g.permute(0, 2, 1, 3).reshape(B, T, -1) # B, T, G * hd
+
+        combo = torch.cat([mean_o_flat, var_g_flat], dim=-1)
+        return self.proj(combo)
+
 class Block(nn.Module):
     def __init__(self, d_model, n_heads, attn_cls, ff_mult=4):
         super().__init__()
@@ -167,7 +206,7 @@ if __name__ == '__main__':
     Ds = [4, 8, 16]
     dists = ['gaussian', 'student_t']
     T_EVAL, B_EVAL = 64, 512
-    STEPS = 800
+    STEPS = 400
     results = []
     for D in Ds:
         for dist in dists:
@@ -180,7 +219,8 @@ if __name__ == '__main__':
             target_var = float(((Yte - Yte.mean(0)) ** 2).mean())
 
             row = {'D': D, 'dist': dist, 'empirical_corr_mse': base_mse, 'predict_mean_mse': target_var}
-            for name, cls in [('standard', StdAttn), ('density', DensityAttn), ('moment', MomentAttn)]:
+            variants = [('standard', StdAttn), ('density', DensityAttn), ('moment', MomentAttn), ('gma', GroupedMomentAttn)]
+            for name, cls in variants:
                 np.random.seed(data_seed)  # both models see identical training data sequence
                 t0 = time.time()
                 log_every = 200 if D == 8 else None
@@ -198,11 +238,13 @@ if __name__ == '__main__':
     for r in results:
         improve_dens = 100 * (1 - r['density_mse'] / r['standard_mse'])
         improve_mom = 100 * (1 - r['moment_mse'] / r['standard_mse'])
+        improve_gma = 100 * (1 - r['gma_mse'] / r['standard_mse'])
         print(f"D={r['D']:2d} {r['dist']:10s} | empirical={r['empirical_corr_mse']:.5f} "
               f"predict-mean={r['predict_mean_mse']:.5f} | standard={r['standard_mse']:.5f} "
-              f"density={r['density_mse']:.5f} moment={r['moment_mse']:.5f}")
-        print(f"   density improvement={improve_dens:+.1f}% | moment improvement={improve_mom:+.1f}%")
+              f"density={r['density_mse']:.5f} moment={r['moment_mse']:.5f} gma={r['gma_mse']:.5f}")
+        print(f"   density improvement={improve_dens:+.1f}% | moment={improve_mom:+.1f}% | gma={improve_gma:+.1f}%")
         if 'standard_history' in r:
             print("   std history :", r.get('standard_history', []))
             print("   density_history:", r.get('density_history', []))
             print("   moment_history:", r.get('moment_history', []))
+            print("   gma_history   :", r.get('gma_history', []))
