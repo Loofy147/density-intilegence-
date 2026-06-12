@@ -36,10 +36,21 @@ def empirical_corr_mse(X, Y):
         preds[b] = c[iu]
     return float(((preds - Y) ** 2).mean())
 
+def get_batch_empirical_corr(x):
+    """Computes empirical correlation for a batch of (B, T, D). Returns (B, D*(D-1)//2)."""
+    B, T, D = x.shape
+    # Center and scale
+    mu = x.mean(dim=1, keepdim=True)
+    std = x.std(dim=1, keepdim=True) + 1e-6
+    x_norm = (x - mu) / std
+    # Covariance of normalized data is correlation
+    cov = (x_norm.transpose(1, 2) @ x_norm) / (T - 1)
+    iu = torch.triu_indices(D, D, offset=1)
+    return cov[:, iu[0], iu[1]]
+
 # ---------- attention variants ----------
 
 class StdAttn(nn.Module):
-    """Standard scaled dot-product attention: output = attn-weighted MEAN of values."""
     def __init__(self, d_model, n_heads):
         super().__init__()
         self.h, self.hd = n_heads, d_model // n_heads
@@ -51,13 +62,10 @@ class StdAttn(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         a = (q @ k.transpose(-2, -1)) / self.hd ** 0.5
         a = a.softmax(-1)
-        o = (a @ v).permute(0, 2, 1, 3).reshape(B, T, D)
+        o = (a @ v).permute(0, 2, 1, 3).reshape(B, T, -1)
         return self.proj(o)
 
 class DensityAttn(nn.Module):
-    """Covariance attention: each head outputs attn-weighted MEAN *and* attn-weighted
-    COVARIANCE of its values, i.e. the joint shape of what it's looking at, not just
-    its location."""
     def __init__(self, d_model, n_heads):
         super().__init__()
         self.h, self.hd = n_heads, d_model // n_heads
@@ -72,18 +80,85 @@ class DensityAttn(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         a = (q @ k.transpose(-2, -1)) / hd ** 0.5
         a = a.softmax(-1)
-        mean_o = a @ v  # B,H,T,hd  (first moment)
+        mean_o = a @ v
         v_outer = torch.einsum('bhtd,bhte->bhtde', v, v)
         second = torch.einsum('bhij,bhjde->bhide', a, v_outer)
         mean_outer = torch.einsum('bhid,bhie->bhide', mean_o, mean_o)
-        cov = second - mean_outer  # attn-weighted covariance per query position
+        cov = second - mean_outer
         cov_flat = cov.reshape(B, H, T, hd * hd)
         cov_flat = self.cov_ln(cov_flat)
         cov_o = self.cov_proj(cov_flat)
-        mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, D)
-        cov_o = cov_o.permute(0, 2, 1, 3).reshape(B, T, D)
+        mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        cov_o = cov_o.permute(0, 2, 1, 3).reshape(B, T, -1)
         combo = torch.cat([mean_o, cov_o], dim=-1)
         return self.proj(combo)
+
+class MomentAttn(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.h, self.hd = n_heads, d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.proj = nn.Linear(2 * d_model, d_model)
+    def forward(self, x):
+        B, T, D = x.shape
+        H, hd = self.h, self.hd
+        qkv = self.qkv(x).view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        a = (q @ k.transpose(-2, -1)) / hd ** 0.5
+        a = a.softmax(-1)
+        mean_o = a @ v
+        mean_sq_o = a @ (v**2)
+        var_o = torch.relu(mean_sq_o - mean_o**2)
+        mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        var_o = var_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        combo = torch.cat([mean_o, var_o], dim=-1)
+        return self.proj(combo)
+
+class GroupedMomentAttn(nn.Module):
+    def __init__(self, d_model, n_heads, n_groups=1):
+        super().__init__()
+        self.h, self.hd = n_heads, d_model // n_heads
+        self.g = n_groups
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.proj = nn.Linear(d_model + self.g * self.hd, d_model)
+    def forward(self, x):
+        B, T, D = x.shape
+        H, hd, G = self.h, self.hd, self.g
+        qkv = self.qkv(x).view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        a = (q @ k.transpose(-2, -1)) / hd ** 0.5
+        a = a.softmax(-1)
+        mean_o = a @ v
+        v_g = v[:, :G, :, :]
+        a_g = a[:, :G, :, :]
+        mean_sq_g = a_g @ (v_g**2)
+        var_g = torch.relu(mean_sq_g - (mean_o[:, :G, :, :]**2))
+        mean_o_flat = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        var_g_flat = var_g.permute(0, 2, 1, 3).reshape(B, T, -1)
+        combo = torch.cat([mean_o_flat, var_g_flat], dim=-1)
+        return self.proj(combo)
+
+class MomentModulatedAttn(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        self.h, self.hd = n_heads, d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
+        self.proj = nn.Linear(d_model, d_model)
+    def forward(self, x):
+        B, T, D = x.shape
+        H, hd = self.h, self.hd
+        qkv = self.qkv(x).view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        a = (q @ k.transpose(-2, -1)) / hd ** 0.5
+        a = a.softmax(-1)
+        mean_o = a @ v
+        mean_sq_o = a @ (v**2)
+        var_o = torch.relu(mean_sq_o - mean_o**2)
+        mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        var_o = var_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        modulated = mean_o * self.gate(var_o)
+        return self.proj(modulated)
 
 class Block(nn.Module):
     def __init__(self, d_model, n_heads, attn_cls, ff_mult=4):
@@ -98,81 +173,126 @@ class Block(nn.Module):
         return x
 
 class CorrEstimator(nn.Module):
-    def __init__(self, D, d_model=64, n_heads=4, n_layers=2, attn_cls=StdAttn):
+    def __init__(self, D, d_model=64, n_heads=4, n_layers=2, attn_cls=StdAttn, map_pooling=True):
         super().__init__()
+        self.map_pooling = map_pooling
         self.embed = nn.Linear(D, d_model)
         self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         out_dim = D * (D - 1) // 2
-        self.head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, out_dim))
+        head_in = 2 * d_model if map_pooling else d_model
+        self.head = nn.Sequential(nn.Linear(head_in, d_model), nn.GELU(), nn.Linear(d_model, out_dim))
     def forward(self, x):
+        x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-6)
         h = self.embed(x)
         for blk in self.blocks:
             h = blk(h)
-        h = self.ln_f(h).mean(dim=1)  # pool over the T samples (set, not sequence)
-        return self.head(h)
+        h = self.ln_f(h)
+        if self.map_pooling:
+            pool = torch.cat([h.mean(dim=1), h.var(dim=1)], dim=-1)
+        else:
+            pool = h.mean(dim=1)
+        return self.head(pool)
+
+class AnchoredCorrEstimator(nn.Module):
+    """Refined Baseline: computes empirical correlation and predicts correction in Fisher-Z space."""
+    def __init__(self, D, d_model=64, n_heads=4, n_layers=2, attn_cls=MomentModulatedAttn):
+        super().__init__()
+        self.D = D
+        self.embed = nn.Linear(D, d_model)
+        self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls) for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(d_model)
+        out_dim = D * (D - 1) // 2
+        self.head = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, out_dim))
+    def forward(self, x):
+        rho_emp = get_batch_empirical_corr(x)
+        x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-6)
+        h = self.embed(x)
+        for blk in self.blocks:
+            h = blk(h)
+        h = self.ln_f(h)
+        pool = torch.cat([h.mean(dim=1), h.var(dim=1)], dim=-1)
+        delta = self.head(pool)
+        z_emp = torch.atanh(torch.clamp(rho_emp, -0.999, 0.999))
+        return torch.tanh(z_emp + delta)
+
+class ShrinkageCorrEstimator(nn.Module):
+    """Structural Eigen-Projection: predicts a shrinkage factor to blend empirical with identity."""
+    def __init__(self, D, d_model=64, n_heads=4, n_layers=2, attn_cls=MomentModulatedAttn):
+        super().__init__()
+        self.embed = nn.Linear(D, d_model)
+        self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls) for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(d_model)
+        self.alpha_head = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1), nn.Sigmoid())
+    def forward(self, x):
+        rho_emp = get_batch_empirical_corr(x)
+        x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-6)
+        h = self.embed(x)
+        for blk in self.blocks:
+            h = blk(h)
+        h = self.ln_f(h)
+        pool = torch.cat([h.mean(dim=1), h.var(dim=1)], dim=-1)
+        alpha = self.alpha_head(pool) # B, 1
+        return (1 - alpha) * rho_emp # identity part in triu vector space is 0
 
 # ---------- training ----------
 
-def train_and_eval(D, dist, attn_cls, Xte, Yte, steps=800, T=64, B=64, lr=3e-3, log_every=None):
+def train_and_eval(D, dist, model_cls, Xte, Yte, steps=800, T=64, B=64, lr=3e-3, log_every=None, **kwargs):
     torch.manual_seed(123)
-    model = CorrEstimator(D, attn_cls=attn_cls)
-    opt = torch.optim.Adam(model.parameters(), lr=3e-3)
-    history = []
+    model = model_cls(D, **kwargs)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
     for step in range(steps):
         Xb, Yb = sample_batch(B, T, D, dist=dist)
-        Xb = torch.from_numpy(Xb); Yb = torch.from_numpy(Yb)
+        Xb, Yb = torch.from_numpy(Xb), torch.from_numpy(Yb)
         pred = model(Xb)
         loss = ((pred - Yb) ** 2).mean()
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        if log_every and (step % log_every == 0 or step == steps - 1):
-            history.append((step, loss.item()))
     model.eval()
     with torch.no_grad():
         pred = model(torch.from_numpy(Xte))
         mse = ((pred - torch.from_numpy(Yte)) ** 2).mean().item()
     nparams = sum(p.numel() for p in model.parameters())
-    return mse, nparams, history
+    return mse, nparams
 
 if __name__ == '__main__':
     Ds = [4, 8, 16]
     dists = ['gaussian', 'student_t']
     T_EVAL, B_EVAL = 64, 512
-    STEPS = 800
+    STEPS = 400
     results = []
     for D in Ds:
         for dist in dists:
             eval_seed = 9000 + D * 2 + (0 if dist == 'gaussian' else 1)
             data_seed = 5000 + D * 2 + (0 if dist == 'gaussian' else 1)
-
             np.random.seed(eval_seed)
             Xte, Yte = sample_batch(B_EVAL, T_EVAL, D, dist=dist)
             base_mse = empirical_corr_mse(Xte, Yte)
-            target_var = float(((Yte - Yte.mean(0)) ** 2).mean())
+            row = {'D': D, 'dist': dist, 'empirical_corr_mse': base_mse}
 
-            row = {'D': D, 'dist': dist, 'empirical_corr_mse': base_mse, 'predict_mean_mse': target_var}
-            for name, cls in [('standard', StdAttn), ('density', DensityAttn)]:
-                np.random.seed(data_seed)  # both models see identical training data sequence
+            variants = [
+                ('standard', CorrEstimator, {'attn_cls': StdAttn}),
+                ('mma_map', CorrEstimator, {'attn_cls': MomentModulatedAttn}),
+                ('anchored', AnchoredCorrEstimator, {}),
+                ('shrinkage', ShrinkageCorrEstimator, {})
+            ]
+            for name, cls, kwargs in variants:
+                np.random.seed(data_seed)
                 t0 = time.time()
-                log_every = 200 if D == 8 else None
-                mse, nparams, hist = train_and_eval(D, dist, cls, Xte, Yte, steps=STEPS, log_every=log_every)
+                mse, nparams = train_and_eval(D, dist, cls, Xte, Yte, steps=STEPS, **kwargs)
                 dt = time.time() - t0
                 row[f'{name}_mse'] = mse
                 row[f'{name}_params'] = nparams
                 row[f'{name}_time'] = dt
-                if hist:
-                    row[f'{name}_history'] = hist
-                print(f"D={D:2d} dist={dist:10s} model={name:8s} mse={mse:.5f} params={nparams:6d} time={dt:5.1f}s")
+                print(f"D={D:2d} dist={dist:10s} model={name:8s} mse={mse:.5f} params={nparams:6d} time={dt:4.1f}s")
             results.append(row)
 
     print("\n=== SUMMARY ===")
     for r in results:
-        improve = 100 * (1 - r['density_mse'] / r['standard_mse'])
-        print(f"D={r['D']:2d} {r['dist']:10s} | empirical={r['empirical_corr_mse']:.5f} "
-              f"predict-mean={r['predict_mean_mse']:.5f} | standard={r['standard_mse']:.5f} "
-              f"density={r['density_mse']:.5f} | density improvement={improve:+.1f}%")
-        if 'standard_history' in r:
-            print("   std history :", r['standard_history'])
-            print("   dens history:", r['density_history'])
+        improve_mma = 100 * (1 - r['mma_map_mse'] / r['standard_mse'])
+        improve_anc = 100 * (1 - r['anchored_mse'] / r['standard_mse'])
+        improve_shrk = 100 * (1 - r['shrinkage_mse'] / r['standard_mse'])
+        print(f"D={r['D']:2d} {r['dist']:10s} | empirical={r['empirical_corr_mse']:.5f} | "
+              f"std={r['standard_mse']:.5f} mma={r['mma_map_mse']:.5f} anc={r['anchored_mse']:.5f} shr={r['shrinkage_mse']:.5f}")
+        print(f"   mma improve={improve_mma:+.1f}% | anc={improve_anc:+.1f}% | shr={improve_shrk:+.1f}%")
