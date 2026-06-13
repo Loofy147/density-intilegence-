@@ -2,6 +2,40 @@ import torch
 import torch.nn as nn
 from pipeline import get_batch_empirical_corr, preprocess_input
 
+def triu_to_full(tri_v, D):
+    """Reconstruct a symmetric matrix from its upper triangular part (excluding diagonal)."""
+    B = tri_v.shape[0]
+    mat = torch.eye(D, device=tri_v.device).unsqueeze(0).repeat(B, 1, 1)
+    iu = torch.triu_indices(D, D, offset=1, device=tri_v.device)
+    mat[:, iu[0], iu[1]] = tri_v
+    mat[:, iu[1], iu[0]] = tri_v
+    return mat
+
+def full_to_triu(mat):
+    """Extract upper triangular part (excluding diagonal) from a symmetric matrix."""
+    D = mat.shape[-1]
+    iu = torch.triu_indices(D, D, offset=1, device=mat.device)
+    return mat[:, iu[0], iu[1]]
+
+class PSDProjector(nn.Module):
+    """Ensures a correlation matrix is PSD by clipping eigenvalues or using shrinkage."""
+    def __init__(self, D, min_eig=1e-6):
+        super().__init__()
+        self.D = D
+        self.min_eig = min_eig
+    def forward(self, tri_v):
+        B = tri_v.shape[0]
+        mat = triu_to_full(tri_v, self.D)
+        # Use eigh for symmetric matrices
+        e, v = torch.linalg.eigh(mat)
+        e = torch.clamp(e, min=self.min_eig)
+        # Reconstruct
+        mat_psd = v @ torch.diag_embed(e) @ v.transpose(-2, -1)
+        # Ensure it's a correlation matrix (diagonal = 1)
+        d = torch.sqrt(torch.diagonal(mat_psd, dim1=-2, dim2=-1))
+        mat_psd = mat_psd / (d.unsqueeze(-1) * d.unsqueeze(-2))
+        return full_to_triu(mat_psd)
+
 class StdAttn(nn.Module):
     def __init__(self, d_model, n_heads):
         super().__init__()
@@ -65,8 +99,8 @@ class GroupedMomentAttn(nn.Module):
         mean_sq_g = a_g @ (v_g**2)
         var_g = torch.relu(mean_sq_g - mean_g**2)
 
-        # Broadcast group variance back to all heads
-        var_o = var_g.repeat(1, H // G, 1, 1)
+        # Broadcast group variance back to all heads using expand
+        var_o = var_g.unsqueeze(2).expand(-1, -1, H // G, -1, -1).reshape(B, H, T, hd)
 
         mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
         var_o = var_o.permute(0, 2, 1, 3).reshape(B, T, -1)
@@ -74,10 +108,10 @@ class GroupedMomentAttn(nn.Module):
         return self.proj(modulated)
 
 class Block(nn.Module):
-    def __init__(self, d_model, n_heads, attn_cls, ff_mult=4):
+    def __init__(self, d_model, n_heads, attn_cls, ff_mult=4, **kwargs):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = attn_cls(d_model, n_heads)
+        self.attn = attn_cls(d_model, n_heads, **kwargs)
         self.ln2 = nn.LayerNorm(d_model)
         self.ff = nn.Sequential(nn.Linear(d_model, ff_mult * d_model), nn.GELU(), nn.Linear(ff_mult * d_model, d_model))
     def forward(self, x):
@@ -86,15 +120,17 @@ class Block(nn.Module):
         return x
 
 class BaseCorrEstimator(nn.Module):
-    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=StdAttn, map_pooling=True):
+    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=StdAttn, map_pooling=True, **kwargs):
         super().__init__()
+        self.D = D
         self.map_pooling = map_pooling
         self.embed = nn.Linear(D, d_model)
-        self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls, **kwargs) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         out_dim = D * (D - 1) // 2
         head_in = 2 * d_model if map_pooling else d_model
         self.head = nn.Sequential(nn.Linear(head_in, d_model), nn.GELU(), nn.Linear(d_model, out_dim))
+        self.psd_proj = PSDProjector(D)
     def forward(self, x):
         x = preprocess_input(x)
         h = self.embed(x)
@@ -105,16 +141,19 @@ class BaseCorrEstimator(nn.Module):
             pool = torch.cat([h.mean(dim=1), h.var(dim=1)], dim=-1)
         else:
             pool = h.mean(dim=1)
-        return self.head(pool)
+        out = self.head(pool)
+        return self.psd_proj(out)
 
 class AnchoredCorrEstimator(nn.Module):
-    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=MomentModulatedAttn):
+    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=MomentModulatedAttn, **kwargs):
         super().__init__()
+        self.D = D
         self.embed = nn.Linear(D, d_model)
-        self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls, **kwargs) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         out_dim = D * (D - 1) // 2
         self.head = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, out_dim))
+        self.psd_proj = PSDProjector(D)
     def forward(self, x):
         rho_emp = get_batch_empirical_corr(x)
         x = preprocess_input(x)
@@ -125,13 +164,15 @@ class AnchoredCorrEstimator(nn.Module):
         pool = torch.cat([h.mean(dim=1), h.var(dim=1)], dim=-1)
         delta = self.head(pool)
         z_emp = torch.atanh(torch.clamp(rho_emp, -0.999, 0.999))
-        return torch.tanh(z_emp + delta)
+        out = torch.tanh(z_emp + delta)
+        return self.psd_proj(out)
 
 class ShrinkageCorrEstimator(nn.Module):
-    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=MomentModulatedAttn):
+    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=MomentModulatedAttn, **kwargs):
         super().__init__()
+        self.D = D
         self.embed = nn.Linear(D, d_model)
-        self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls, **kwargs) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
         self.alpha_head = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1), nn.Sigmoid())
     def forward(self, x):
@@ -143,4 +184,6 @@ class ShrinkageCorrEstimator(nn.Module):
         h = self.ln_f(h)
         pool = torch.cat([h.mean(dim=1), h.var(dim=1)], dim=-1)
         alpha = self.alpha_head(pool)
+        # Shrinkage towards Identity: (1-alpha)*R_emp + alpha*I
+        # For off-diagonals, this is (1-alpha)*rho_emp + alpha*0 = (1-alpha)*rho_emp
         return (1 - alpha) * rho_emp
