@@ -39,6 +39,40 @@ class MomentModulatedAttn(nn.Module):
         modulated = mean_o * self.gate(var_o)
         return self.proj(modulated)
 
+class GroupedMomentAttn(nn.Module):
+    def __init__(self, d_model, n_heads, n_groups=2):
+        super().__init__()
+        self.h, self.hd = n_heads, d_model // n_heads
+        self.g = n_groups
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
+        self.proj = nn.Linear(d_model, d_model)
+    def forward(self, x):
+        B, T, D = x.shape
+        H, hd, G = self.h, self.hd, self.g
+        qkv = self.qkv(x).view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        a = (q @ k.transpose(-2, -1)) / hd ** 0.5
+        a = a.softmax(-1)
+
+        # Mean for all heads
+        mean_o = a @ v
+
+        # Variance for groups (using first G heads as templates)
+        a_g = a[:, :G]
+        v_g = v[:, :G]
+        mean_g = mean_o[:, :G]
+        mean_sq_g = a_g @ (v_g**2)
+        var_g = torch.relu(mean_sq_g - mean_g**2)
+
+        # Broadcast group variance back to all heads
+        var_o = var_g.repeat(1, H // G, 1, 1)
+
+        mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        var_o = var_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        modulated = mean_o * self.gate(var_o)
+        return self.proj(modulated)
+
 class Block(nn.Module):
     def __init__(self, d_model, n_heads, attn_cls, ff_mult=4):
         super().__init__()
@@ -52,7 +86,7 @@ class Block(nn.Module):
         return x
 
 class BaseCorrEstimator(nn.Module):
-    def __init__(self, D, d_model=64, n_heads=4, n_layers=2, attn_cls=StdAttn, map_pooling=True):
+    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=StdAttn, map_pooling=True):
         super().__init__()
         self.map_pooling = map_pooling
         self.embed = nn.Linear(D, d_model)
@@ -74,7 +108,7 @@ class BaseCorrEstimator(nn.Module):
         return self.head(pool)
 
 class AnchoredCorrEstimator(nn.Module):
-    def __init__(self, D, d_model=64, n_heads=4, n_layers=2, attn_cls=MomentModulatedAttn):
+    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=MomentModulatedAttn):
         super().__init__()
         self.embed = nn.Linear(D, d_model)
         self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls) for _ in range(n_layers)])
@@ -94,7 +128,7 @@ class AnchoredCorrEstimator(nn.Module):
         return torch.tanh(z_emp + delta)
 
 class ShrinkageCorrEstimator(nn.Module):
-    def __init__(self, D, d_model=64, n_heads=4, n_layers=2, attn_cls=MomentModulatedAttn):
+    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=MomentModulatedAttn):
         super().__init__()
         self.embed = nn.Linear(D, d_model)
         self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls) for _ in range(n_layers)])
