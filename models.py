@@ -1,24 +1,9 @@
 import torch
 import torch.nn as nn
-from pipeline import get_batch_empirical_corr, preprocess_input
-
-def triu_to_full(tri_v, D):
-    """Reconstruct a symmetric matrix from its upper triangular part (excluding diagonal)."""
-    B = tri_v.shape[0]
-    mat = torch.eye(D, device=tri_v.device).unsqueeze(0).repeat(B, 1, 1)
-    iu = torch.triu_indices(D, D, offset=1, device=tri_v.device)
-    mat[:, iu[0], iu[1]] = tri_v
-    mat[:, iu[1], iu[0]] = tri_v
-    return mat
-
-def full_to_triu(mat):
-    """Extract upper triangular part (excluding diagonal) from a symmetric matrix."""
-    D = mat.shape[-1]
-    iu = torch.triu_indices(D, D, offset=1, device=mat.device)
-    return mat[:, iu[0], iu[1]]
+from pipeline import get_batch_empirical_corr, preprocess_input, triu_to_full, full_to_triu
 
 class PSDProjector(nn.Module):
-    """Ensures a correlation matrix is PSD by clipping eigenvalues or using shrinkage."""
+    """Ensures a correlation matrix is PSD by clipping eigenvalues."""
     def __init__(self, D, min_eig=1e-6):
         super().__init__()
         self.D = D
@@ -26,8 +11,14 @@ class PSDProjector(nn.Module):
     def forward(self, tri_v):
         B = tri_v.shape[0]
         mat = triu_to_full(tri_v, self.D)
-        # Use eigh for symmetric matrices
+
+        # Eigen-decomposition
         e, v = torch.linalg.eigh(mat)
+
+        # Fast path check
+        if torch.all(e >= self.min_eig):
+            return tri_v
+
         e = torch.clamp(e, min=self.min_eig)
         # Reconstruct
         mat_psd = v @ torch.diag_embed(e) @ v.transpose(-2, -1)
@@ -46,7 +37,7 @@ class StdAttn(nn.Module):
         B, T, D = x.shape
         qkv = self.qkv(x).view(B, T, 3, self.h, self.hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        a = (q @ k.transpose(-2, -1)) / self.hd ** 0.5
+        a = (q @ k.transpose(-2, -1)) / (self.hd ** 0.5)
         a = a.softmax(-1)
         o = (a @ v).permute(0, 2, 1, 3).reshape(B, T, -1)
         return self.proj(o)
@@ -63,14 +54,17 @@ class MomentModulatedAttn(nn.Module):
         H, hd = self.h, self.hd
         qkv = self.qkv(x).view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        a = (q @ k.transpose(-2, -1)) / hd ** 0.5
+        a = (q @ k.transpose(-2, -1)) / (hd ** 0.5)
         a = a.softmax(-1)
+
         mean_o = a @ v
         mean_sq_o = a @ (v**2)
         var_o = torch.relu(mean_sq_o - mean_o**2)
-        mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
-        var_o = var_o.permute(0, 2, 1, 3).reshape(B, T, -1)
-        modulated = mean_o * self.gate(var_o)
+
+        mean_o_res = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        var_o_res = var_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+
+        modulated = mean_o_res * self.gate(var_o_res)
         return self.proj(modulated)
 
 class GroupedMomentAttn(nn.Module):
@@ -86,25 +80,21 @@ class GroupedMomentAttn(nn.Module):
         H, hd, G = self.h, self.hd, self.g
         qkv = self.qkv(x).view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        a = (q @ k.transpose(-2, -1)) / hd ** 0.5
+        a = (q @ k.transpose(-2, -1)) / (hd ** 0.5)
         a = a.softmax(-1)
 
-        # Mean for all heads
         mean_o = a @ v
+        mean_o_g = mean_o.view(B, G, H // G, T, hd)
+        v_g = v.view(B, G, H // G, T, hd)
+        a_g = a.view(B, G, H // G, T, T)
 
-        # Variance for groups (using first G heads as templates)
-        a_g = a[:, :G]
-        v_g = v[:, :G]
-        mean_g = mean_o[:, :G]
-        mean_sq_g = a_g @ (v_g**2)
-        var_g = torch.relu(mean_sq_g - mean_g**2)
+        mean_sq_o_g = a_g @ (v_g**2)
+        var_o_g = torch.relu(mean_sq_o_g - mean_o_g**2)
+        var_o = var_o_g.view(B, H, T, hd)
 
-        # Broadcast group variance back to all heads using expand
-        var_o = var_g.unsqueeze(2).expand(-1, -1, H // G, -1, -1).reshape(B, H, T, hd)
-
-        mean_o = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
-        var_o = var_o.permute(0, 2, 1, 3).reshape(B, T, -1)
-        modulated = mean_o * self.gate(var_o)
+        mean_o_res = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        var_o_res = var_o.permute(0, 2, 1, 3).reshape(B, T, -1)
+        modulated = mean_o_res * self.gate(var_o_res)
         return self.proj(modulated)
 
 class Block(nn.Module):
@@ -174,7 +164,10 @@ class ShrinkageCorrEstimator(nn.Module):
         self.embed = nn.Linear(D, d_model)
         self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls, **kwargs) for _ in range(n_layers)])
         self.ln_f = nn.LayerNorm(d_model)
-        self.alpha_head = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1), nn.Sigmoid())
+        out_dim = D * (D - 1) // 2
+        self.head = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1 + out_dim))
+        self.psd_proj = PSDProjector(D)
+
     def forward(self, x):
         rho_emp = get_batch_empirical_corr(x)
         x = preprocess_input(x)
@@ -183,7 +176,10 @@ class ShrinkageCorrEstimator(nn.Module):
             h = blk(h)
         h = self.ln_f(h)
         pool = torch.cat([h.mean(dim=1), h.var(dim=1)], dim=-1)
-        alpha = self.alpha_head(pool)
-        # Shrinkage towards Identity: (1-alpha)*R_emp + alpha*I
-        # For off-diagonals, this is (1-alpha)*rho_emp + alpha*0 = (1-alpha)*rho_emp
-        return (1 - alpha) * rho_emp
+
+        out = self.head(pool)
+        alpha = torch.sigmoid(out[:, :1])
+        rho_pred = torch.tanh(out[:, 1:])
+
+        rho_final = (1 - alpha) * rho_emp + alpha * rho_pred
+        return self.psd_proj(rho_final)
