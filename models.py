@@ -15,16 +15,15 @@ class PSDProjector(nn.Module):
         # Eigen-decomposition
         e, v = torch.linalg.eigh(mat)
 
-        # Fast path check
+        # Batch fast-path check
         if torch.all(e >= self.min_eig):
             return tri_v
 
-        e = torch.clamp(e, min=self.min_eig)
-        # Reconstruct
-        mat_psd = v @ torch.diag_embed(e) @ v.transpose(-2, -1)
-        # Ensure it's a correlation matrix (diagonal = 1)
-        d = torch.sqrt(torch.diagonal(mat_psd, dim1=-2, dim2=-1))
-        mat_psd = mat_psd / (d.unsqueeze(-1) * d.unsqueeze(-2))
+        e_clamped = torch.clamp(e, min=self.min_eig)
+        mat_psd = v @ torch.diag_embed(e_clamped) @ v.transpose(-2, -1)
+        diag = torch.diagonal(mat_psd, dim1=-2, dim2=-1)
+        d_inv = 1.0 / torch.sqrt(torch.clamp(diag, min=1e-9))
+        mat_psd = mat_psd * d_inv.unsqueeze(-1) * d_inv.unsqueeze(-2)
         return full_to_triu(mat_psd)
 
 class StdAttn(nn.Module):
@@ -41,31 +40,6 @@ class StdAttn(nn.Module):
         a = a.softmax(-1)
         o = (a @ v).permute(0, 2, 1, 3).reshape(B, T, -1)
         return self.proj(o)
-
-class MomentModulatedAttn(nn.Module):
-    def __init__(self, d_model, n_heads):
-        super().__init__()
-        self.h, self.hd = n_heads, d_model // n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model)
-        self.gate = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
-        self.proj = nn.Linear(d_model, d_model)
-    def forward(self, x):
-        B, T, D = x.shape
-        H, hd = self.h, self.hd
-        qkv = self.qkv(x).view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        a = (q @ k.transpose(-2, -1)) / (hd ** 0.5)
-        a = a.softmax(-1)
-
-        mean_o = a @ v
-        mean_sq_o = a @ (v**2)
-        var_o = torch.relu(mean_sq_o - mean_o**2)
-
-        mean_o_res = mean_o.permute(0, 2, 1, 3).reshape(B, T, -1)
-        var_o_res = var_o.permute(0, 2, 1, 3).reshape(B, T, -1)
-
-        modulated = mean_o_res * self.gate(var_o_res)
-        return self.proj(modulated)
 
 class GroupedMomentAttn(nn.Module):
     def __init__(self, d_model, n_heads, n_groups=2):
@@ -134,8 +108,38 @@ class BaseCorrEstimator(nn.Module):
         out = self.head(pool)
         return self.psd_proj(out)
 
+class ShrinkageCorrEstimator(nn.Module):
+    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=StdAttn, **kwargs):
+        super().__init__()
+        self.D = D
+        self.embed = nn.Linear(D, d_model)
+        self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls, **kwargs) for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(d_model)
+        out_dim = D * (D - 1) // 2
+        self.head = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1 + out_dim))
+        self.psd_proj = PSDProjector(D)
+    def forward(self, x):
+        rho_emp = get_batch_empirical_corr(x)
+        x = preprocess_input(x)
+        h = self.embed(x)
+        for blk in self.blocks:
+            h = blk(h)
+        h = self.ln_f(h)
+        pool = torch.cat([h.mean(dim=1), h.var(dim=1)], dim=-1)
+        out = self.head(pool)
+        alpha = torch.sigmoid(out[:, :1])
+        rho_pred = torch.tanh(out[:, 1:])
+        rho_final = (1 - alpha) * rho_emp + alpha * rho_pred
+        return self.psd_proj(rho_final)
+
+class GMA_ShrinkageCorrEstimator(ShrinkageCorrEstimator):
+    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, n_groups=2, **kwargs):
+        super().__init__(D, d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+                         attn_cls=GroupedMomentAttn, n_groups=n_groups, **kwargs)
+
 class AnchoredCorrEstimator(nn.Module):
-    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=MomentModulatedAttn, **kwargs):
+    """Stub to keep density_attn.py happy, or implement properly if needed."""
+    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=StdAttn, **kwargs):
         super().__init__()
         self.D = D
         self.embed = nn.Linear(D, d_model)
@@ -153,33 +157,14 @@ class AnchoredCorrEstimator(nn.Module):
         h = self.ln_f(h)
         pool = torch.cat([h.mean(dim=1), h.var(dim=1)], dim=-1)
         delta = self.head(pool)
-        z_emp = torch.atanh(torch.clamp(rho_emp, -0.999, 0.999))
+        z_emp = torch.atanh(torch.clamp(rho_emp, -0.99, 0.99))
         out = torch.tanh(z_emp + delta)
         return self.psd_proj(out)
 
-class ShrinkageCorrEstimator(nn.Module):
-    def __init__(self, D, d_model=64, n_heads=8, n_layers=2, attn_cls=MomentModulatedAttn, **kwargs):
+class MomentModulatedAttn(nn.Module):
+    """Compatibility stub."""
+    def __init__(self, d_model, n_heads, **kwargs):
         super().__init__()
-        self.D = D
-        self.embed = nn.Linear(D, d_model)
-        self.blocks = nn.ModuleList([Block(d_model, n_heads, attn_cls, **kwargs) for _ in range(n_layers)])
-        self.ln_f = nn.LayerNorm(d_model)
-        out_dim = D * (D - 1) // 2
-        self.head = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, 1 + out_dim))
-        self.psd_proj = PSDProjector(D)
-
+        self.attn = GroupedMomentAttn(d_model, n_heads, n_groups=1)
     def forward(self, x):
-        rho_emp = get_batch_empirical_corr(x)
-        x = preprocess_input(x)
-        h = self.embed(x)
-        for blk in self.blocks:
-            h = blk(h)
-        h = self.ln_f(h)
-        pool = torch.cat([h.mean(dim=1), h.var(dim=1)], dim=-1)
-
-        out = self.head(pool)
-        alpha = torch.sigmoid(out[:, :1])
-        rho_pred = torch.tanh(out[:, 1:])
-
-        rho_final = (1 - alpha) * rho_emp + alpha * rho_pred
-        return self.psd_proj(rho_final)
+        return self.attn(x)

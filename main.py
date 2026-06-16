@@ -1,153 +1,124 @@
 import math
 import collections
-from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet, ROTATION_RADIUS_LIMIT
 
-# PHYSICS CONSTANTS
+# ORBIT WARS - APEX V78
 CX, CY = 50.0, 50.0
-SUN_SAFE = 10.12 # Very aggressive path skimming
-
-def get_dist(p1, p2):
-    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+SUN_SAFE_SQ = 10.14 ** 2
 
 def get_fleet_speed(ships):
-    if ships <= 1.1: return 1.0
-    # Speed formula: 1 + 5 * (log(max(1.1, ships)) / log(1000))^1.5
-    return 1.0 + 5.0 * (math.log(ships) / 6.9077) ** 1.5
+    s = max(1.1, float(ships))
+    return 1.0 + 5.0 * (math.log(s) / 6.907755) ** 1.5
 
-def predict_pos(p, dt, av, obs):
-    # COMETS
-    comet_ids = obs.get("comet_planet_ids", [])
-    if p.id in comet_ids:
-        for g in obs.get("comets", []):
-            if p.id in g['planet_ids']:
-                idx = g['planet_ids'].index(p.id)
-                path = g['paths'][idx]
-                f_idx = int(g['path_index'] + dt)
-                if f_idx < len(path): return path[f_idx]
-                return path[-1]
-    # ORBIT
-    d = math.hypot(p.x - CX, p.y - CY)
-    if d > ROTATION_RADIUS_LIMIT: return (p.x, p.y)
-    angle = math.atan2(p.y - CY, p.x - CX) + av * dt
-    return (CX + d * math.cos(angle), CY + d * math.sin(angle))
+def get_predicted_pos(t_id, t_pos, eta, obs):
+    # 1. Comets
+    for g in obs.get("comets", []):
+        if t_id in g['planet_ids']:
+            idx = g['planet_ids'].index(t_id)
+            path = g['paths'][idx]
+            # path_index is current index
+            f_idx = int(g['path_index'] + eta)
+            if f_idx < len(path): return path[f_idx]
+            return path[-1]
 
-def is_path_safe(p1, p2):
-    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-    d2 = dx*dx + dy*dy
-    if d2 < 1e-9: return True
-    t = max(0, min(1, ((CX - p1[0]) * dx + (CY - p1[1]) * dy) / d2))
-    return ((p1[0] + t * dx - CX)**2 + (p1[1] + t * dy - CY)**2) > SUN_SAFE**2
+    # 2. Orbits
+    av = obs.get("angular_velocity", 0.0)
+    d = math.hypot(t_pos[0]-CX, t_pos[1]-CY)
+    if d < 1e-3: return t_pos
+    if d > 40.0: return t_pos # Not orbiting (shouldn't happen for non-comets in most maps)
+
+    cur_ang = math.atan2(t_pos[1]-CY, t_pos[0]-CX)
+    res_ang = cur_ang + av * eta
+    return (CX + d * math.cos(res_ang), CY + d * math.sin(res_ang))
 
 def agent(obs, config):
     try:
-        player = obs.get("player", 0)
-        planets = [Planet(*p) for p in obs.get("planets", [])]
-        my_planets = [p for p in planets if p.owner == player]
-        if not my_planets: return []
+        p_idx = obs.player
+        planets = obs.planets
+        my = [p for p in planets if p[1] == p_idx]
+        if not my: return []
 
-        av = obs.get("angular_velocity", 0.0)
-
-        # 1. NET SHIP TRACKING (Arrival prediction)
-        net = collections.defaultdict(int)
-        for p in planets:
-            net[p.id] = p.ships if p.owner != player else -p.ships
-
+        # 1. Fleet Tracking
+        net_impact = collections.defaultdict(int)
         for f in obs.get("fleets", []):
-            fl = Fleet(*f)
-            # Find destination (closest planet by angle)
-            best_p, min_diff = None, 0.2
+            f_owner, f_pos, f_angle, f_ships = f[1], (f[2], f[3]), f[4], f[6]
+            target_id, min_diff = None, 0.3
             for p in planets:
-                ang = math.atan2(p.y - fl.y, p.x - fl.x)
-                diff = abs((ang - fl.angle + math.pi) % (2 * math.pi) - math.pi)
-                if diff < min_diff: min_diff, best_p = diff, p
+                ang = math.atan2(p[3]-f_pos[1], p[2]-f_pos[0])
+                diff = abs((ang - f_angle + math.pi) % (2*math.pi) - math.pi)
+                if diff < min_diff: min_diff, target_id = diff, p[0]
+            if target_id is not None:
+                if f_owner == p_idx: net_impact[target_id] -= f_ships
+                else: net_impact[target_id] += f_ships
 
-            if best_p:
-                if fl.owner == player:
-                    if best_p.owner != player: net[best_p.id] -= fl.ships
-                else:
-                    net[best_p.id] += fl.ships
+        moves = []
+        for m in sorted(my, key=lambda x: x[5], reverse=True):
+            m_id, m_pos, m_ships = m[0], (m[2], m[3]), m[5]
 
-        # 2. LOCAL DENSITY (Contextual intelligence)
-        density = {}
-        for p in planets:
-            w, v = [], []
-            for o in planets:
-                d = get_dist((p.x, p.y), (o.x, o.y))
-                if d < 60:
-                    weight = math.exp(-d / 25.0)
-                    val = o.ships if o.owner == player else (-1.8 * o.ships if o.owner != -1 else 0)
-                    w.append(weight)
-                    v.append(val)
-            density[p.id] = sum(wi * vi for wi, vi in zip(w, v)) / sum(w) if w else 0
+            # Defense: Minimum buffer
+            # In early game (few planets), be more aggressive.
+            buffer = 2.0 if len(my) < 3 else 10.0
+            danger = max(0, net_impact[m_id])
+            m_avail = m_ships - (buffer + danger)
+            if m_avail < 2: continue
 
-        moves, reserved = [], collections.defaultdict(int)
+            # 2. Target Ranking
+            targets = []
+            for t in planets:
+                if t[1] == p_idx: continue
+                t_id, t_owner, t_pos, t_ships, t_prod = t[0], t[1], (t[2], t[3]), t[5], t[6]
 
-        # 3. HYPER-AGGRESSIVE EXPANSION & INTERCEPTION
-        others = [p for p in planets if p.owner != player]
+                dist = math.hypot(m_pos[0]-t_pos[0], m_pos[1]-t_pos[1])
+                resistance = t_ships + net_impact[t_id]
+                if t_owner != -1:
+                    resistance += (t_prod * (dist / 16.0))
 
-        for m in sorted(my_planets, key=lambda x: x.ships, reverse=True):
-            if m.ships < 2: continue
+                needed = int(resistance + 1)
 
-            # Sort targets for THIS planet based on predicted value
-            def target_score(o):
-                dist = get_dist((m.x, m.y), (o.x, o.y))
-                resistance = max(0, net[o.id])
-                # Value = Production / (Time + Resistance)
-                score = o.production / (resistance + 1) / (dist + 20)
-                if o.owner == -1: score *= 10.0 # Extreme neutral grab
-                return score
+                # Proximity is prioritized for early expansion
+                score = (t_prod + 5) / (dist + 10)
+                if t_owner == -1:
+                    score *= 10.0
+                    if m_avail >= needed: score *= 2.0
+                    else: score *= 0.05 # Don't send if we can't take
 
-            scored_targets = sorted(others, key=target_score, reverse=True)
+                targets.append({'id': t_id, 'pos': t_pos, 'needed': needed, 'score': score, 'owner': t_owner})
 
-            m_avail = m.ships - 1
-            for t in scored_targets:
-                if m_avail <= 0: break
+            targets.sort(key=lambda x: x['score'], reverse=True)
 
-                res = max(0, net[t.id])
-                if t.owner == -1 and net[t.id] < 0: continue # Already winning
+            # 3. Launch
+            for t in targets:
+                if m_avail < 2: break
 
-                needed = res + 1
-                if t.owner != -1: needed += 5 # Margin
+                needed = t['needed']
+                if t['owner'] == -1 and m_avail < needed: continue
 
-                send = min(m_avail, needed)
-                # SCALE: Send slightly more if we have a lot, to move faster
-                if t.owner == -1 and m_avail > 15: send = max(send, 12)
-                send = min(send, m_avail)
+                # Send more for speed if we have it
+                send = min(m_avail, max(needed, 15))
+                if t['owner'] != -1: send = min(m_avail, max(send, 25))
 
-                if send > 0:
-                    # ITERATIVE CURVATURE INTERCEPTION
-                    dist = get_dist((m.x, m.y), (t.x, t.y))
-                    speed = get_fleet_speed(send)
-                    eta = dist / speed
-                    pos = predict_pos(t, eta, av, obs)
-                    # Refine twice
-                    for _ in range(2):
-                        eta = get_dist((m.x, m.y), pos) / speed
-                        pos = predict_pos(t, eta, av, obs)
+                send = int(send)
+                if send < 1: continue
 
-                    if is_path_safe((m.x, m.y), pos):
-                        moves.append([m.id, math.atan2(pos[1] - m.y, pos[0] - m.x), int(send)])
-                        m_avail -= send
-                        reserved[m.id] += send
-                        net[t.id] -= send
-                        if t.owner == -1 and net[t.id] < 0:
-                            others = [o for o in others if o.id != t.id]
-                        break # One mission per planet to maximize breadth
+                # Interception
+                speed = get_fleet_speed(send)
+                f_target = t['pos']
+                for _ in range(3):
+                    eta = math.hypot(m_pos[0]-f_target[0], m_pos[1]-f_target[1]) / speed
+                    f_target = get_predicted_pos(t['id'], t['pos'], eta, obs)
 
-        # 4. EMERGENCY DEFENSE
-        for p in my_planets:
-            if net[p.id] > 0:
-                needed = net[p.id] + 2
-                for h in sorted(my_planets, key=lambda x: get_dist((x.x, x.y), (p.x, p.y))):
-                    if h.id == p.id: continue
-                    avail = h.ships - reserved[h.id] - 1
-                    if avail > 0:
-                        send = min(avail, needed)
-                        moves.append([h.id, math.atan2(p.y - h.y, p.x - h.x), int(send)])
-                        reserved[h.id] += send
-                        net[p.id] -= send
-                        needed -= send
-                        if net[p.id] <= 0: break
+                # Sun
+                dx, dy = f_target[0]-m_pos[0], f_target[1]-m_pos[1]
+                d2 = dx*dx + dy*dy
+                safe = True
+                if d2 > 0:
+                    tv = max(0, min(1, ((CX-m_pos[0])*dx + (CY-m_pos[1])*dy) / d2))
+                    if ((m_pos[0]+tv*dx-CX)**2 + (m_pos[1]+tv*dy-CY)**2) < SUN_SAFE_SQ:
+                        safe = False
 
+                if safe:
+                    moves.append([m_id, math.atan2(f_target[1]-m_pos[1], f_target[0]-m_pos[0]), send])
+                    m_avail -= send
+                    net_impact[t['id']] -= send
+                    if t['owner'] == -1: break # One neutral per source
         return moves
-    except Exception: return []
+    except: return []
