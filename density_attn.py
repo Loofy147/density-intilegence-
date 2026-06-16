@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import time
 from pipeline import sample_batch, empirical_corr_mse, reconstruct_corr_matrix, is_psd_batch
-from models import BaseCorrEstimator, AnchoredCorrEstimator, ShrinkageCorrEstimator, StdAttn, MomentModulatedAttn, GroupedMomentAttn
+from models import RecursiveGMAEstimator,  BaseCorrEstimator, AnchoredCorrEstimator, ShrinkageCorrEstimator, StdAttn, MomentModulatedAttn, GroupedMomentAttn
 
 def fisher_z_loss(pred, target):
     """Loss in Fisher Z-space."""
@@ -77,7 +77,7 @@ if __name__ == '__main__':
     Ds = [4, 16]
     dists = ['gaussian', 'student_t']
     T_EVAL, B_EVAL = 64, 512
-    STEPS = 300
+    STEPS = 100
     results = []
 
     for D in Ds:
@@ -87,7 +87,7 @@ if __name__ == '__main__':
             base_mse = empirical_corr_mse(Xte, Yte)
             row = {'D': D, 'dist': dist, 'empirical_corr_mse': base_mse}
 
-            variants = [
+            variants = [('recursive_gma', RecursiveGMAEstimator, {'n_layers': 4, 'n_groups': 2}),
                 ('standard', BaseCorrEstimator, {'attn_cls': StdAttn}),
                 ('gma', BaseCorrEstimator, {'attn_cls': GroupedMomentAttn, 'n_groups': 2}),
                 ('shrinkage_mse', ShrinkageCorrEstimator, {'loss_type': 'mse'}),
