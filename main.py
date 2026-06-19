@@ -1,9 +1,9 @@
 import math
 import collections
 
-# ORBIT WARS - APEX V122 (The Conqueror - Sync & Steal)
+# ORBIT WARS - APEX V480 (The Alpha Conqueror)
 CX, CY = 50.0, 50.0
-SUN_SAFE_SQ = 11.0 ** 2
+SUN_SAFE_SQ = 10.15 ** 2
 
 def get_fleet_speed(ships):
     s = max(1.1, float(ships))
@@ -22,8 +22,7 @@ def get_predicted_pos(p_dat, eta, obs):
     d = math.hypot(tx-CX, ty-CY)
     if d < 1e-6 or d > 55.0: return (tx, ty)
     cur_ang = math.atan2(ty-CY, tx-CX)
-    res_ang = cur_ang + av * eta
-    return (CX + d * math.cos(res_ang), CY + d * math.sin(res_ang))
+    return (CX + d * math.cos(cur_ang + av*eta), CY + d * math.sin(cur_ang + av*eta))
 
 def simulate_planet(p_dat, target_eta, events):
     curr_o, curr_s, curr_t = p_dat[1], float(p_dat[5]), 0
@@ -52,109 +51,82 @@ def simulate_planet(p_dat, target_eta, events):
 def agent(obs, config):
     try:
         p_idx, planets = obs.player, obs.planets
-        id_map = {p[0]: p for p in planets}
         my = [p for p in planets if p[1] == p_idx]
         if not my: return []
+        others = [p for p in planets if p[1] != p_idx]
 
-        # 1. Prediction Mapping
+        # --- PHASE 1: TURN 0 ALL-IN (Counter-Blitz) ---
+        if obs.step == 0:
+            m = my[0]; mx, myy, m_s = m[2], m[3], m[5]
+            # Find closest neutral. MUST match Blitz bot speed.
+            neutrals = sorted([n for n in others if n[1] == -1], key=lambda n: (mx-n[2])**2 + (myy-n[3])**2)
+            t = neutrals[0]
+            send = int(m_s - 1)
+            eta = math.hypot(mx-t[2], myy-t[3]) / get_fleet_speed(send)
+            f_pos = get_predicted_pos(t, eta, obs)
+            return [[m[0], math.atan2(f_pos[1]-myy, f_pos[0]-mx), send]]
+
+        # --- PHASE 2: STRATEGIC RECURSIVE ---
         fleet_events = collections.defaultdict(list)
         for f in obs.get("fleets", []):
             f_o, fx, fy, f_ang, f_s = f[1], f[2], f[3], f[4], f[6]
-            tid, min_d = None, 0.45
+            tid, min_d = None, 0.4
             for p in planets:
                 ang = math.atan2(p[3]-fy, p[2]-fx)
-                diff = abs((ang-f_ang+math.pi)%(2*math.pi)-math.pi)
-                if diff < min_d: min_d, tid = diff, p[0]
+                if abs((ang-f_ang+math.pi)%(2*math.pi)-math.pi) < min_d: tid = p[0]; break
             if tid is not None:
-                dist = math.hypot(id_map[tid][2]-fx, id_map[tid][3]-fy)
-                fleet_events[tid].append((dist/get_fleet_speed(f_s), f_o, f_s))
+                fleet_events[tid].append((math.hypot(planets[tid][2]-fx, planets[tid][3]-fy)/get_fleet_speed(f_s), f_o, f_s))
 
-        # 2. Mission Scoring
-        missions, turns_left = [], 500 - obs.step
-        for m in my:
-            m_id, mx, myy, m_s, m_p = m[0], m[2], m[3], m[5], m[6]
-            _, _, min_s = simulate_planet(m, 45, fleet_events[m_id])
+        moves, spent = [], collections.defaultdict(float)
 
-            # v122 aggression logic
-            buffer = 0.1 if obs.step < 50 else 8.0
-            m_avail = min(m_s - buffer, (min_s - 0.1) if min_s > 0 else (m_s - 0.5))
-            if m_avail < 1: continue
+        # Priority 1: Instant Defense
+        for m in sorted(my, key=lambda x: x[5]):
+            m_id = m[0]
+            _, _, min_s = simulate_planet(m, 35, fleet_events[m_id])
+            if min_s < 1.0:
+                needed = abs(min_s) + 5
+                helpers = sorted([p for p in my if p[0] != m_id], key=lambda p: math.hypot(p[2]-m[2], p[3]-m[3]))
+                for h in helpers:
+                    h_avail = h[5] - spent[h[0]] - 2.0
+                    if h_avail > 2:
+                        send = min(h_avail, needed)
+                        eta = math.hypot(h[2]-m[2], h[3]-m[3]) / get_fleet_speed(send)
+                        f_pos = get_predicted_pos(m, eta, obs)
+                        moves.append([h[0], math.atan2(f_pos[1]-h[3], f_pos[0]-h[2]), int(send)])
+                        spent[h[0]] += send; needed -= send
+                        if needed <= 0: break
 
-            for t in planets:
-                if t[0] == m_id: continue
-                dist = math.hypot(mx-t[2], myy-t[3])
-                eta = dist / get_fleet_speed(25)
+        # Priority 2: Sequential Expansion (Concentrated Force)
+        for m in sorted(my, key=lambda x: x[5], reverse=True):
+            m_id, mx, myy, m_s = m[0], m[2], m[3], m[5]
+            buffer = 1.1 if obs.step < 60 else 15.0
+            avail = m_s - spent[m_id] - buffer
+            if avail < 10: continue
 
-                # Joint Strike / Arrival Sync
-                is_sync = any(e_o == p_idx and abs(e_eta - eta) < 8 for e_eta, e_o, e_s in fleet_events[t[0]])
+            candidates = []
+            for t in others:
+                d = math.hypot(mx-t[2], myy-t[3])
+                p_o, p_s, _ = simulate_planet(t, 40, fleet_events[t[0]])
+                if p_o == p_idx: continue
+                score = (t[6] * 1000 + 500) / (d + 1)
+                if t[1] == -1: score *= 10.0
+                candidates.append((score, t, d, p_s))
 
-                p_o, p_s, min_s_t = simulate_planet(t, eta, fleet_events[t[0]])
-                if p_o == p_idx:
-                    if min_s_t < 15.0:
-                        missions.append({'src':m, 'dst':t, 'needed':int(40-min_s_t), 'score':5000000/(dist+1), 'type':'def', 'eta':eta})
-                    continue
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            for score, t, d, p_s in candidates:
+                send = avail
+                eta = d / get_fleet_speed(send)
+                f_pos = get_predicted_pos(t, eta, obs)
 
-                needed = int(p_s + 1)
-                # v122 refined scoring: production weighted by match stage
-                prod_weight = 300 if obs.step < 100 else 600
-                score = (t[6] * turns_left * prod_weight + 10000) / (dist + 5)
-                if is_sync: score *= 2.0
+                # Basic sun safety
+                dx, dy = f_pos[0]-mx, f_pos[1]-myy; d2 = dx*dx + dy*dy
+                if d2 > 0:
+                    tv = max(0, min(1, ((50-mx)*dx+(50-myy)*dy)/d2))
+                    if ((mx+tv*dx-50)**2 + (myy+tv*dy-50)**2) < SUN_SAFE_SQ: continue
 
-                if t[1] == -1:
-                    score *= 20.0
-                    # Steal-Timing: arrive immediately after enemy
-                    enemy_arr = [e_eta for e_eta, e_o, e_s in fleet_events[t[0]] if e_o != p_idx and e_o != -1]
-                    if enemy_arr and min(enemy_arr) < eta: score *= 4.0
+                moves.append([m_id, math.atan2(f_pos[1]-myy, f_pos[0]-mx), int(send)])
+                spent[m_id] += send
+                break
 
-                    if obs.step == 0: score = 10**9 / (dist + 0.1)
-                    if m_avail < needed and obs.step > 25: score *= 0.00001
-                elif t[1] != -1:
-                    if p_o != t[1]: score *= 4.0 # Active conflict
-
-                missions.append({'src':m, 'dst':t, 'needed':needed, 'score':score, 'type':'atk', 'eta':eta})
-
-        missions.sort(key=lambda x: x['score'], reverse=True)
-
-        # 3. Execution
-        moves, spent, covered = [], collections.defaultdict(float), collections.defaultdict(float)
-        turn_launches = collections.defaultdict(list)
-        for mis in missions:
-            if len(moves) >= 80: break
-            m, t = mis['src'], mis['dst']
-            all_m_ev = sorted(fleet_events[m[0]] + turn_launches[m[0]])
-            _, _, min_s = simulate_planet(m, 45, all_m_ev)
-            buffer = 0.1 if obs.step < 50 else 8.0
-            m_avail = min(m[5] - spent[m[0]] - buffer, (min_s - spent[m[0]] - 0.2) if min_s > 0 else (m[5] - spent[m[0]] - 0.5))
-            if m_avail < 1: continue
-
-            all_t_ev = sorted(fleet_events[t[0]] + turn_launches[t[0]])
-            speed_est = get_fleet_speed(min(m_avail, 25))
-            eta_est = math.hypot(m[2]-t[2], m[3]-t[3]) / speed_est
-            p_o, p_s, _ = simulate_planet(t, eta_est, all_t_ev)
-            if p_o == p_idx: continue
-
-            needed = int(p_s + 1)
-            if mis['type'] == 'atk':
-                if t[1] == -1 and m_avail < needed and obs.step > 30: continue
-                send = min(m_avail, max(needed, 18 if obs.step < 60 else 45))
-            else:
-                send = min(m_avail, mis['needed'] - covered[t[0]])
-
-            send = int(send)
-            if send < 2: continue
-            speed = get_fleet_speed(send)
-            f_pos = (t[2], t[3])
-            for _ in range(4):
-                f_eta = math.hypot(m[2]-f_pos[0], m[3]-f_pos[1]) / speed
-                f_pos = get_predicted_pos(t, f_eta, obs)
-            dx, dy = f_pos[0]-m[2], f_pos[1]-m[3]
-            d2 = dx*dx + dy*dy
-            if d2 > 0:
-                tv = max(0, min(1, ((CX-m[2])*dx+(CY-m[3])*dy)/d2))
-                if ((m[2]+tv*dx-CX)**2 + (m[3]+tv*dy-CY)**2) < SUN_SAFE_SQ: continue
-
-            moves.append([m[0], math.atan2(f_pos[1]-m[3], f_pos[0]-m[2]), send])
-            spent[m[0]], covered[t[0]] = spent[m[0]]+send, covered[t[0]]+send
-            if t[1] == -1: break
         return moves
     except: return []
